@@ -218,3 +218,61 @@ def transition_room_to_playing(room_code: str) -> bool:
         return True
     except Room.DoesNotExist:
         return False
+
+
+def record_match_result(
+    room_code: str,
+    winner_player_id: str,
+    total_turns: int,
+    scoreboard: Dict[str, int],
+    started_at: Optional[timezone.datetime] = None,
+) -> Optional[Any]:
+    """
+    Persist completed match record to PostgreSQL matches table (§8.1).
+    """
+    from rooms.models import Match
+    try:
+        room = Room.objects.get(room_code=room_code.upper())
+        room.status = RoomStatus.FINISHED
+        room.save(update_fields=["status"])
+
+        winner = RoomPlayer.objects.filter(id=winner_player_id).first()
+        now = timezone.now()
+        start = started_at or (now - timezone.timedelta(seconds=120))
+        duration = int((now - start).total_seconds())
+
+        match = Match.objects.create(
+            room=room,
+            winner_player=winner,
+            total_turns=total_turns,
+            duration_seconds=max(1, duration),
+            started_at=start,
+            finished_at=now,
+            final_scoreboard=scoreboard,
+        )
+        return match
+    except Exception as exc:
+        logger.error(f"Failed to record match result: {exc}")
+        return None
+
+
+def reset_room_to_lobby(room_code: str, host_player_id: str) -> Tuple[bool, str]:
+    """
+    Host clicks 'Play Again' - forces room back to WAITING status (§4.3).
+    Resets all non-host player ready states to False.
+    """
+    try:
+        room = Room.objects.get(room_code=room_code.upper())
+    except Room.DoesNotExist:
+        return False, "ROOM_NOT_FOUND"
+
+    if str(room.host_player_id) != str(host_player_id):
+        return False, "NOT_ROOM_HOST"
+
+    room.status = RoomStatus.WAITING
+    room.save(update_fields=["status"])
+
+    # Reset guest ready states
+    room.players.filter(is_host=False).update(is_ready=False)
+    return True, "RESET_SUCCESSFUL"
+

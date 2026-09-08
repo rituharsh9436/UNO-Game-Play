@@ -1,10 +1,11 @@
 """
 Django Channels WebSocket Consumer for Room Lobbies and Real-Time Presence.
-Compliant with docs.md Sections 4.3, 4.4, 6.1, 6.2, 6.3, and 12.
+Compliant with docs.md Sections 4.3, 4.4, 5, 6, 8, and 12.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any, Dict, Optional
@@ -13,11 +14,14 @@ from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncJsonWebsocketConsumer
 from django.core.cache import cache
 
+from engine.constants import CardColor
 from engine.models import GameRules
-from engine.state import UnoGameEngine
+from engine.state import GameEngineError, UnoGameEngine
 from rooms.services import (
     get_lobby_state,
     kick_player_from_lobby,
+    record_match_result,
+    reset_room_to_lobby,
     set_player_connection_status,
     set_player_ready_status,
     transition_room_to_playing,
@@ -27,8 +31,9 @@ from rooms.services import (
 
 logger = logging.getLogger(__name__)
 
-# Active in-memory / cache registry for active game engines
+# In-memory registry of active game engines mapped to room codes
 ACTIVE_GAMES: Dict[str, UnoGameEngine] = {}
+GAME_START_TIMES: Dict[str, float] = {}
 
 
 class UnoGameConsumer(AsyncJsonWebsocketConsumer):
@@ -36,8 +41,10 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
     Asynchronous WebSocket consumer managing:
     - Ephemeral single-use ticket verification (§6.1).
     - Lobby presence, readiness, and host privilege enforcement (§4.4).
-    - Room multicasting via Redis channels layer.
+    - Server-authoritative gameplay loops (card plays, draws, turn progression) (§5).
+    - UNO call & 3.0-second catch challenge windows (§5.5).
     - Rate limiting protection (5 actions/sec) (§12.2).
+    - Individualized zero-leakage state synchronization (§6.3 & §12.6).
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -118,8 +125,13 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
             }
         )
 
-        # Broadcast updated lobby state to all participants
-        await self._broadcast_lobby_state()
+        # Broadcast current state: if game active, send game sync; else lobby sync
+        engine = ACTIVE_GAMES.get(self.room_code)
+        if engine and engine.state.status == "PLAYING":
+            sanitized = engine.get_sanitized_state(self.player_id)
+            await self.send_json(sanitized)
+        else:
+            await self._broadcast_lobby_state()
 
     async def disconnect(self, close_code: int) -> None:
         """Handle disconnection and host failover (§4.4 & §7)."""
@@ -135,8 +147,10 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
                     self.player_id, False, auto_migrate_host=True
                 )
 
-                # Broadcast updated lobby state to remaining players
-                await self._broadcast_lobby_state()
+                # Broadcast updated state
+                engine = ACTIVE_GAMES.get(self.room_code)
+                if not engine or engine.state.status != "PLAYING":
+                    await self._broadcast_lobby_state()
 
     async def receive_json(self, content: Dict[str, Any], **kwargs: Any) -> None:
         """Handle incoming messages with token-bucket rate limiting (§12.2)."""
@@ -169,6 +183,16 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
                 await self.send_json({"type": "lobby_state_sync", "version": 1, "payload": state})
             return
 
+        elif msg_type == "request_full_state_sync":
+            engine = ACTIVE_GAMES.get(self.room_code)
+            if engine and engine.state.status == "PLAYING":
+                await self.send_json(engine.get_sanitized_state(self.player_id))
+            else:
+                state = await database_sync_to_async(get_lobby_state)(self.room_code)
+                if state:
+                    await self.send_json({"type": "lobby_state_sync", "version": 1, "payload": state})
+            return
+
         elif msg_type == "toggle_ready":
             is_ready = bool(payload.get("is_ready", True))
             success = await database_sync_to_async(set_player_ready_status)(self.player_id, is_ready)
@@ -178,6 +202,22 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
 
         elif msg_type == "host_action":
             await self._handle_host_action(payload)
+            return
+
+        elif msg_type == "play_card":
+            await self._handle_play_card(payload)
+            return
+
+        elif msg_type == "draw_card":
+            await self._handle_draw_card(payload)
+            return
+
+        elif msg_type == "pass_turn":
+            await self._handle_pass_turn(payload)
+            return
+
+        elif msg_type == "catch_uno":
+            await self._handle_catch_uno(payload)
             return
 
         else:
@@ -190,6 +230,200 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
                     },
                 }
             )
+
+    async def _handle_play_card(self, payload: Dict[str, Any]) -> None:
+        """Process card play action via authoritative UnoGameEngine (§5.3 - §5.5)."""
+        engine = ACTIVE_GAMES.get(self.room_code)
+        if not engine or engine.state.status != "PLAYING":
+            await self.send_json(
+                {"type": "error_event", "payload": {"code": "NO_ACTIVE_MATCH", "message": "No match in progress."}}
+            )
+            return
+
+        card_id = payload.get("card_id", "")
+        raw_color = payload.get("selected_color")
+        call_uno = bool(payload.get("call_uno", False))
+        selected_color = CardColor(raw_color) if raw_color else None
+
+        try:
+            result = engine.play_card(
+                player_id=self.player_id,
+                card_id=card_id,
+                selected_color=selected_color,
+                call_uno=call_uno,
+            )
+        except GameEngineError as exc:
+            await self.send_json(
+                {"type": "error_event", "payload": {"code": exc.code, "message": exc.message}}
+            )
+            return
+
+        # Broadcast card_played sound event
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {"type": "card_played_broadcast", "card_id": card_id},
+        )
+
+        # Check for victory
+        if result.get("status") == "GAME_WON":
+            winner_id = result["winner_id"]
+            winner_nickname = result["winner_nickname"]
+            scoreboard = result["scoreboard"]
+            turns = result["total_turns"]
+
+            # Persist to database
+            await database_sync_to_async(record_match_result)(
+                room_code=self.room_code,
+                winner_player_id=winner_id,
+                total_turns=turns,
+                scoreboard=scoreboard,
+            )
+
+            # Broadcast match completion
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {
+                    "type": "game_finished_broadcast",
+                    "winner_id": winner_id,
+                    "winner_nickname": winner_nickname,
+                    "scoreboard": scoreboard,
+                },
+            )
+            return
+
+        # Check if UNO vulnerability window opened
+        if result.get("opened_vulnerability_window"):
+            vuln_id = result["vulnerable_player_id"]
+            target = engine.state.get_player(vuln_id)
+            nick = target.nickname if target else "Player"
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {
+                    "type": "uno_vulnerability_window_broadcast",
+                    "vulnerable_player_id": vuln_id,
+                    "nickname": nick,
+                    "window_ms": 3000,
+                },
+            )
+
+        # Broadcast turn changed event
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                "type": "turn_changed_broadcast",
+                "current_player_id": engine.state.current_player.player_id,
+                "turn_deadline_ms": engine.state.turn_deadline_ms,
+                "direction": engine.state.direction.value,
+            },
+        )
+
+        # Dispatch fresh sanitized state to each player
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {"type": "dispatch_sanitized_states", "room_code": self.room_code},
+        )
+
+    async def _handle_draw_card(self, payload: Dict[str, Any]) -> None:
+        """Process card draw action via UnoGameEngine."""
+        engine = ACTIVE_GAMES.get(self.room_code)
+        if not engine or engine.state.status != "PLAYING":
+            await self.send_json(
+                {"type": "error_event", "payload": {"code": "NO_ACTIVE_MATCH", "message": "No match in progress."}}
+            )
+            return
+
+        try:
+            result = engine.draw_card(self.player_id)
+        except GameEngineError as exc:
+            await self.send_json(
+                {"type": "error_event", "payload": {"code": exc.code, "message": exc.message}}
+            )
+            return
+
+        # Broadcast card_drawn sound event
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {"type": "card_drawn_broadcast", "player_id": self.player_id},
+        )
+
+        # If turn advanced (accepted stack penalty)
+        if result.get("turn_advanced"):
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {
+                    "type": "turn_changed_broadcast",
+                    "current_player_id": engine.state.current_player.player_id,
+                    "turn_deadline_ms": engine.state.turn_deadline_ms,
+                    "direction": engine.state.direction.value,
+                },
+            )
+
+        # Dispatch updated states
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {"type": "dispatch_sanitized_states", "room_code": self.room_code},
+        )
+
+    async def _handle_pass_turn(self, payload: Dict[str, Any]) -> None:
+        """Process turn pass after drawing."""
+        engine = ACTIVE_GAMES.get(self.room_code)
+        if not engine or engine.state.status != "PLAYING":
+            await self.send_json(
+                {"type": "error_event", "payload": {"code": "NO_ACTIVE_MATCH", "message": "No match in progress."}}
+            )
+            return
+
+        try:
+            engine.pass_turn(self.player_id)
+        except GameEngineError as exc:
+            await self.send_json(
+                {"type": "error_event", "payload": {"code": exc.code, "message": exc.message}}
+            )
+            return
+
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                "type": "turn_changed_broadcast",
+                "current_player_id": engine.state.current_player.player_id,
+                "turn_deadline_ms": engine.state.turn_deadline_ms,
+                "direction": engine.state.direction.value,
+            },
+        )
+
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {"type": "dispatch_sanitized_states", "room_code": self.room_code},
+        )
+
+    async def _handle_catch_uno(self, payload: Dict[str, Any]) -> None:
+        """Process Catch UNO challenge (§5.5)."""
+        engine = ACTIVE_GAMES.get(self.room_code)
+        if not engine or engine.state.status != "PLAYING":
+            await self.send_json(
+                {"type": "error_event", "payload": {"code": "NO_ACTIVE_MATCH", "message": "No match in progress."}}
+            )
+            return
+
+        target_id = payload.get("target_player_id", "")
+        try:
+            engine.catch_uno(challenger_player_id=self.player_id, target_player_id=target_id)
+        except GameEngineError as exc:
+            await self.send_json(
+                {"type": "error_event", "payload": {"code": exc.code, "message": exc.message}}
+            )
+            return
+
+        # Broadcast uno_alert sound
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {"type": "uno_alert_broadcast"},
+        )
+
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {"type": "dispatch_sanitized_states", "room_code": self.room_code},
+        )
 
     async def _handle_host_action(self, payload: Dict[str, Any]) -> None:
         """Validate and dispatch host actions with permission check (§4.4)."""
@@ -215,7 +449,6 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
                 self.room_code, self.player_id, target_id
             )
             if success:
-                # Broadcast kick notice and new lobby state
                 await self.channel_layer.group_send(
                     self.room_group_name,
                     {
@@ -258,7 +491,6 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
                 )
                 return
 
-            # Initialize pure Python game engine
             rules = GameRules.from_dict(rules_dict)
             engine = UnoGameEngine.create_game(
                 room_code=self.room_code,
@@ -266,11 +498,10 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
                 rules=rules,
             )
             ACTIVE_GAMES[self.room_code] = engine
+            GAME_START_TIMES[self.room_code] = time.time()
 
-            # Update DB status to PLAYING
             await database_sync_to_async(transition_room_to_playing)(self.room_code)
 
-            # Broadcast game_started notification
             await self.channel_layer.group_send(
                 self.room_group_name,
                 {
@@ -279,7 +510,6 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
                 },
             )
 
-            # Emit individualized sanitized state sync to each player (§6.3)
             await self.channel_layer.group_send(
                 self.room_group_name,
                 {
@@ -287,6 +517,12 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
                     "room_code": self.room_code,
                 },
             )
+
+        elif action == "RESTART_MATCH":
+            ACTIVE_GAMES.pop(self.room_code, None)
+            GAME_START_TIMES.pop(self.room_code, None)
+            await database_sync_to_async(reset_room_to_lobby)(self.room_code, self.player_id)
+            await self._broadcast_lobby_state()
 
         else:
             await self.send_json(
@@ -311,9 +547,8 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
                 },
             )
 
-    # Handlers for channel layer group messages
+    # Handlers for channel layer broadcast messages
     async def lobby_state_broadcast(self, event: Dict[str, Any]) -> None:
-        """Forward broadcast lobby state to client."""
         await self.send_json(
             {
                 "type": "lobby_state_sync",
@@ -323,7 +558,6 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
         )
 
     async def player_kicked_event(self, event: Dict[str, Any]) -> None:
-        """Notify client if they have been kicked."""
         target_id = event.get("target_player_id")
         if self.player_id == target_id:
             await self.send_json(
@@ -335,13 +569,57 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
             await self.close(code=4000)
 
     async def game_started_broadcast(self, event: Dict[str, Any]) -> None:
-        """Notify clients that match has started."""
         await self.send_json(
             {
                 "type": "game_started",
                 "payload": {
                     "room_code": event["room_code"],
                     "status": "PLAYING",
+                },
+            }
+        )
+
+    async def card_played_broadcast(self, event: Dict[str, Any]) -> None:
+        await self.send_json({"type": "card_played", "payload": {"card_id": event.get("card_id")}})
+
+    async def card_drawn_broadcast(self, event: Dict[str, Any]) -> None:
+        await self.send_json({"type": "card_drawn", "payload": {"player_id": event.get("player_id")}})
+
+    async def uno_alert_broadcast(self, event: Dict[str, Any]) -> None:
+        await self.send_json({"type": "uno_alert", "payload": {}})
+
+    async def uno_vulnerability_window_broadcast(self, event: Dict[str, Any]) -> None:
+        await self.send_json(
+            {
+                "type": "uno_vulnerability_window",
+                "payload": {
+                    "vulnerable_player_id": event.get("vulnerable_player_id"),
+                    "nickname": event.get("nickname"),
+                    "window_ms": event.get("window_ms", 3000),
+                },
+            }
+        )
+
+    async def turn_changed_broadcast(self, event: Dict[str, Any]) -> None:
+        await self.send_json(
+            {
+                "type": "turn_changed",
+                "payload": {
+                    "current_player_id": event.get("current_player_id"),
+                    "turn_deadline_ms": event.get("turn_deadline_ms"),
+                    "direction": event.get("direction"),
+                },
+            }
+        )
+
+    async def game_finished_broadcast(self, event: Dict[str, Any]) -> None:
+        await self.send_json(
+            {
+                "type": "game_finished",
+                "payload": {
+                    "winner_id": event.get("winner_id"),
+                    "winner_nickname": event.get("winner_nickname"),
+                    "scoreboard": event.get("scoreboard", {}),
                 },
             }
         )
