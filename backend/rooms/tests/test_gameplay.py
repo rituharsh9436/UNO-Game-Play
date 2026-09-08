@@ -105,8 +105,10 @@ class TestLiveGameplayIntegration:
         assert guest_summary_in_host["card_count"] == 7
         assert "hand" not in guest_summary_in_host
 
-        # Host has 7 cards with is_playable flags
-        assert len(h_state["payload"]["your_hand"]) == 7
+        # Host has 7 cards (or 9 cards if first top card was Draw Two per §5.2)
+        top_card_val = h_state["payload"]["top_card"]["value"]
+        expected_host_cards = 9 if top_card_val == "DRAW_TWO" else 7
+        assert len(h_state["payload"]["your_hand"]) == expected_host_cards
 
         # Test active engine
         engine = ACTIVE_GAMES.get("PLAY01")

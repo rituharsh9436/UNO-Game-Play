@@ -55,6 +55,7 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
         self.nickname: str = ""
         self.is_host: bool = False
         self.action_timestamps: list[float] = []
+        self.last_sync_timestamp: float = 0.0
 
     async def connect(self) -> None:
         """Handshake with ephemeral single-use ticket authentication (§6.1)."""
@@ -112,6 +113,12 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
 
         await self.accept()
 
+        # Check for 45s grace period reconnection recovery (§7)
+        grace_key = f"grace_period:{self.room_code}:{self.player_id}"
+        if cache.get(grace_key):
+            cache.delete(grace_key)
+            logger.info(f"Player {self.nickname} ({self.player_id}) recovered within 45s grace window.")
+
         # Send connection confirmation to client
         await self.send_json(
             {
@@ -125,16 +132,22 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
             }
         )
 
-        # Broadcast current state: if game active, send game sync; else lobby sync
+        # If match is in progress, mark reconnected in active engine and broadcast state sync
         engine = ACTIVE_GAMES.get(self.room_code)
         if engine and engine.state.status == "PLAYING":
-            sanitized = engine.get_sanitized_state(self.player_id)
-            await self.send_json(sanitized)
+            player = engine.state.get_player(self.player_id)
+            if player:
+                player.connected = True
+            # Broadcast sanitized state sync to client and opponents
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {"type": "dispatch_sanitized_states", "room_code": self.room_code},
+            )
         else:
             await self._broadcast_lobby_state()
 
     async def disconnect(self, close_code: int) -> None:
-        """Handle disconnection and host failover (§4.4 & §7)."""
+        """Handle disconnection, 45s grace window, and host failover (§4.4 & §7)."""
         if self.room_group_name:
             await self.channel_layer.group_discard(
                 self.room_group_name,
@@ -147,9 +160,29 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
                     self.player_id, False, auto_migrate_host=True
                 )
 
-                # Broadcast updated state
                 engine = ACTIVE_GAMES.get(self.room_code)
-                if not engine or engine.state.status != "PLAYING":
+                if engine and engine.state.status == "PLAYING":
+                    # Active Match Disconnection (§7): start 45-second grace period in cache/Redis
+                    cache.set(f"grace_period:{self.room_code}:{self.player_id}", True, timeout=45)
+                    player = engine.state.get_player(self.player_id)
+                    if player:
+                        player.connected = False
+
+                    # Broadcast player disconnection to opponents
+                    await self.channel_layer.group_send(
+                        self.room_group_name,
+                        {
+                            "type": "player_disconnected_broadcast",
+                            "player_id": self.player_id,
+                            "nickname": self.nickname,
+                            "grace_window_seconds": 45,
+                        },
+                    )
+                    await self.channel_layer.group_send(
+                        self.room_group_name,
+                        {"type": "dispatch_sanitized_states", "room_code": self.room_code},
+                    )
+                else:
                     await self._broadcast_lobby_state()
 
     async def receive_json(self, content: Dict[str, Any], **kwargs: Any) -> None:
@@ -184,6 +217,20 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
             return
 
         elif msg_type == "request_full_state_sync":
+            # Token-bucket rate limiting: max 1 call per 3 seconds per player (§12.2)
+            if now - self.last_sync_timestamp < 3.0:
+                await self.send_json(
+                    {
+                        "type": "error_event",
+                        "payload": {
+                            "code": "SYNC_RATE_LIMITED",
+                            "message": "State sync requests are rate-limited to 1 per 3 seconds.",
+                        },
+                    }
+                )
+                return
+            self.last_sync_timestamp = now
+
             engine = ACTIVE_GAMES.get(self.room_code)
             if engine and engine.state.status == "PLAYING":
                 await self.send_json(engine.get_sanitized_state(self.player_id))
@@ -567,6 +614,19 @@ class UnoGameConsumer(AsyncJsonWebsocketConsumer):
                 }
             )
             await self.close(code=4000)
+
+    async def player_disconnected_broadcast(self, event: Dict[str, Any]) -> None:
+        await self.send_json(
+            {
+                "type": "player_disconnected",
+                "payload": {
+                    "player_id": event.get("player_id"),
+                    "nickname": event.get("nickname"),
+                    "grace_window_seconds": event.get("grace_window_seconds", 45),
+                },
+            }
+        )
+
 
     async def game_started_broadcast(self, event: Dict[str, Any]) -> None:
         await self.send_json(

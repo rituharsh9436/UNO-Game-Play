@@ -27,8 +27,11 @@ class TestUnoGameEngine:
         state = engine.state
         assert state.room_code == "ROOM01"
         assert len(state.players) == 4
-        for p in state.players:
-            assert p.card_count == 7
+        for i, p in enumerate(state.players):
+            if i == 0 and state.top_card.value == CardValue.DRAW_TWO:
+                assert p.card_count == 9
+            else:
+                assert p.card_count == 7
         assert state.status == "PLAYING"
         assert state.top_card is not None
         assert state.active_color is not None

@@ -14,13 +14,14 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from rooms.models import Room, RoomPlayer, RoomStatus
+from rooms.models import Room, RoomPlayer, RoomStatus, default_house_rules
 from rooms.serializers import (
     CreateRoomSerializer,
     JoinRoomSerializer,
     RoomSerializer,
     TicketRequestSerializer,
 )
+from rooms.throttling import RoomCreationRateThrottle, RoomLookupRateThrottle
 
 # 32-character unambiguous alphabet specified in docs.md Section 4.1
 ROOM_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -88,7 +89,10 @@ class CreateRoomView(APIView):
     """
     Create a new game room and register the creator as the Host.
     Returns the room details and secret host session token.
+    Throttled to max 5 creations per IP per hour (§12.2).
     """
+
+    throttle_classes = [RoomCreationRateThrottle]
 
     def post(self, request: Request) -> Response:
         serializer = CreateRoomSerializer(data=request.data)
@@ -105,7 +109,7 @@ class CreateRoomView(APIView):
             room_code=room_code,
             host_player_id=host_player_id,
             status=RoomStatus.WAITING,
-            house_rules=house_rules or None,
+            house_rules=house_rules or default_house_rules(),
         )
 
         player = RoomPlayer.objects.create(
@@ -139,11 +143,14 @@ class RoomDetailView(APIView):
     Retrieve room state and participants by 6-character room code.
     """
 
+    throttle_classes = [RoomLookupRateThrottle]
+
     def get(self, request: Request, room_code: str) -> Response:
         code = room_code.upper().strip()
         try:
             room = Room.objects.prefetch_related("players").get(room_code=code)
         except Room.DoesNotExist:
+            RoomLookupRateThrottle.record_failed_attempt(request)
             return Response(
                 {"error": "Room not found or expired.", "code": "ROOM_NOT_FOUND"},
                 status=status.HTTP_404_NOT_FOUND,
@@ -158,11 +165,14 @@ class JoinRoomView(APIView):
     Join an existing room as a guest participant.
     """
 
+    throttle_classes = [RoomLookupRateThrottle]
+
     def post(self, request: Request, room_code: str) -> Response:
         code = room_code.upper().strip()
         try:
             room = Room.objects.get(room_code=code)
         except Room.DoesNotExist:
+            RoomLookupRateThrottle.record_failed_attempt(request)
             return Response(
                 {"error": "Room not found.", "code": "ROOM_NOT_FOUND"},
                 status=status.HTTP_404_NOT_FOUND,
