@@ -54,6 +54,7 @@ export interface SanitizedGameState {
   active_color: CardColor;
   draw_pile_count: number;
   discard_pile_count: number;
+  pending_draw_count?: number;
   opponents: Opponent[];
   your_hand: Card[];
 }
