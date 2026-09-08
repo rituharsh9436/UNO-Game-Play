@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { Users, Shield, Zap, Flame, ArrowRight, Play, PlusCircle } from "lucide-react";
+import { API_BASE_URL } from "@/lib/config";
 
 export default function HomePage() {
   const [activeTab, setActiveTab] = useState<"create" | "join">("create");
@@ -23,7 +24,7 @@ export default function HomePage() {
     setErrorMessage(null);
 
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/rooms/", {
+      const res = await fetch(`${API_BASE_URL}/api/rooms/`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -69,7 +70,7 @@ export default function HomePage() {
     const cleanCode = roomCode.trim().toUpperCase();
 
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/rooms/${cleanCode}/join/`, {
+      const res = await fetch(`${API_BASE_URL}/api/rooms/${cleanCode}/join/`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -304,7 +305,7 @@ export default function HomePage() {
         <span>Real-Time Multiplayer UNO Web Platform • Version 2.1 Baseline</span>
         <div className="flex items-center gap-4">
           <a
-            href="http://127.0.0.1:8000/api/health/"
+            href={`${API_BASE_URL}/api/health/`}
             target="_blank"
             rel="noreferrer"
             className="hover:text-neutral-300 transition-colors"

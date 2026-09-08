@@ -22,5 +22,5 @@ COPY . .
 
 EXPOSE 8000
 
-# Run with Daphne ASGI server
-CMD ["daphne", "-b", "0.0.0.0", "-p", "8000", "uno_project.asgi:application"]
+# Run database migrations and start Daphne ASGI server on dynamic cloud port
+CMD ["sh", "-c", "python manage.py migrate && daphne -b 0.0.0.0 -p ${PORT:-8000} uno_project.asgi:application"]

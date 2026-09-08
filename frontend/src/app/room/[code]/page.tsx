@@ -19,6 +19,7 @@ import {
   WifiOff,
 } from "lucide-react";
 import { RoomDetails, RoomParticipant } from "@/types/game";
+import { API_BASE_URL, WS_BASE_URL } from "@/lib/config";
 
 interface LobbyPlayer {
   player_id: string;
@@ -86,7 +87,7 @@ export default function RoomLobbyPage({ params }: { params: Promise<{ code: stri
     const connectWebSocket = async () => {
       try {
         // Step 1: Exchange session token for 30s single-use ticket
-        const ticketRes = await fetch("http://127.0.0.1:8000/api/rooms/ticket/", {
+        const ticketRes = await fetch(`${API_BASE_URL}/api/rooms/ticket/`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ session_token: session.session_token }),
@@ -100,7 +101,7 @@ export default function RoomLobbyPage({ params }: { params: Promise<{ code: stri
         const ticket = ticketData.ticket;
 
         // Step 2: Open WebSocket with ticket query parameter
-        const wsUrl = `ws://127.0.0.1:8000/ws/rooms/${roomCode}/?ticket=${ticket}`;
+        const wsUrl = `${WS_BASE_URL}/ws/rooms/${roomCode}/?ticket=${ticket}`;
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
 
@@ -229,7 +230,7 @@ export default function RoomLobbyPage({ params }: { params: Promise<{ code: stri
     if (!joinNickname.trim()) return;
     setIsJoining(true);
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/rooms/${roomCode}/join/`, {
+      const res = await fetch(`${API_BASE_URL}/api/rooms/${roomCode}/join/`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ nickname: joinNickname.trim() }),

@@ -4,6 +4,7 @@ Compliant with Django 5.x, Channels 4.x, and Daphne ASGI.
 """
 
 import os
+import urllib.parse
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -76,7 +77,8 @@ WSGI_APPLICATION = "uno_project.wsgi.application"
 ASGI_APPLICATION = "uno_project.asgi.application"
 
 # Database Configuration
-# Defaults to PostgreSQL when configured; fallbacks cleanly to SQLite for local development/testing.
+# Supports NeonDB / Cloud PostgreSQL via DATABASE_URL, explicit envs, or SQLite fallback.
+database_url = os.getenv("DATABASE_URL")
 DB_ENGINE = os.getenv("DB_ENGINE", "").lower()
 DB_NAME = os.getenv("DB_NAME", "uno_db")
 DB_USER = os.getenv("DB_USER", "postgres")
@@ -85,7 +87,22 @@ DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
 USE_POSTGRES = os.getenv("USE_POSTGRES", "false").lower() in ("true", "1", "yes")
 
-if USE_POSTGRES or DB_ENGINE == "postgresql":
+if database_url:
+    parsed = urllib.parse.urlparse(database_url)
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": parsed.path.lstrip("/"),
+            "USER": parsed.username,
+            "PASSWORD": parsed.password,
+            "HOST": parsed.hostname,
+            "PORT": parsed.port or 5432,
+            "OPTIONS": {
+                "sslmode": "require",
+            },
+        }
+    }
+elif USE_POSTGRES or DB_ENGINE == "postgresql":
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.postgresql",

@@ -19,6 +19,7 @@ import CenterTable from "@/components/game/CenterTable";
 import PlayerHand from "@/components/game/PlayerHand";
 import UnoActionControls from "@/components/game/UnoActionControls";
 import WildColorPicker from "@/components/game/WildColorPicker";
+import { API_BASE_URL, WS_BASE_URL } from "@/lib/config";
 
 export default function GameArenaPage({ params }: { params: Promise<{ code: string }> }) {
   const resolvedParams = use(params);
@@ -63,7 +64,7 @@ export default function GameArenaPage({ params }: { params: Promise<{ code: stri
 
     const connect = async () => {
       try {
-        const ticketRes = await fetch("http://127.0.0.1:8000/api/rooms/ticket/", {
+        const ticketRes = await fetch(`${API_BASE_URL}/api/rooms/ticket/`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ session_token: session.session_token }),
@@ -72,7 +73,7 @@ export default function GameArenaPage({ params }: { params: Promise<{ code: stri
         if (!ticketRes.ok) throw new Error("Ticket request failed");
         const { ticket } = await ticketRes.json();
 
-        const ws = new WebSocket(`ws://127.0.0.1:8000/ws/rooms/${roomCode}/?ticket=${ticket}`);
+        const ws = new WebSocket(`${WS_BASE_URL}/ws/rooms/${roomCode}/?ticket=${ticket}`);
         wsRef.current = ws;
 
         ws.onopen = () => {
